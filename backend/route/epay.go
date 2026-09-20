@@ -270,7 +270,7 @@ func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey stri
 	if err != nil {
 		return errors.New("上游微信通道不可用：" + err.Error())
 	}
-	// 串行化 查库存→补库存→下单：库存不足才一次性补到配置的库存目标（默认 ¥1000），
+	// 串行化 查库存→补库存→下单：库存低于目标就一次性补到配置的库存目标（默认 ¥1000），
 	// 订单金额超过库存目标时按订单数量补
 	unlock := e.Up.OrderLock()
 	defer unlock()
@@ -279,8 +279,9 @@ func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey stri
 		return errors.New("上游商品未配置：请先在个人页登录上游账号，系统将自动创建兑换码商品")
 	}
 	_, _, stock, err := e.Up.GoodsInfo(ctx, goodsID)
-	if err == nil && stock < quantity {
-		target := e.Db.SettingInt("up_stock_amount", 100000) / unitPrice
+	target := e.Db.SettingInt("up_stock_amount", 100000) / unitPrice
+	if err == nil && stock < target {
+		// 库存低于目标即补到目标；订单数量超过目标时按订单数量补
 		add := target - stock
 		if need := quantity - stock; add < need {
 			add = need
