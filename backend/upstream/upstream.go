@@ -159,26 +159,48 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 	return addr, nil
 }
 
-// fetchWorkingAddr 取号 + 探活循环：probe 端点返回 JSON 才算可用出口。
-// 最多尝试 proxyProbeMax 个号，避免坏池无限循环（实测该池通过率约 1/15）。
-const proxyProbeMax = 30
-
+// fetchWorkingAddr 取号 + 探活：代理池部分出口被上游 WAF 标记（实测通过率约 1/15），
+// 8 个并发 worker 各自取号探活，任一返回 JSON 即胜出；上限 ~48 个号防止坏池死循环。
 func fetchWorkingAddr(api string) (string, error) {
-	var lastErr error
-	for i := 0; i < proxyProbeMax; i++ {
-		addr, err := fetchProxyAddr(api)
-		if err != nil {
-			return "", err
-		}
-		if probeAddr(addr) {
-			return addr, nil
-		}
-		lastErr = fmt.Errorf("代理 %s 被上游拦截", addr)
+	const workers = 8
+	const triesPerWorker = 6
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	found := make(chan string, 1)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < triesPerWorker; j++ {
+				if ctx.Err() != nil {
+					return
+				}
+				addr, err := fetchProxyAddr(api)
+				if err != nil {
+					return
+				}
+				if probeAddr(addr) {
+					select {
+					case found <- addr:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}()
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("代理 API 未返回可用代理")
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case addr := <-found:
+		return addr, nil
+	case <-done:
+		return "", fmt.Errorf("代理池探测 %d 个号均被上游拦截", workers*triesPerWorker)
+	case <-time.After(45 * time.Second):
+		return "", fmt.Errorf("代理池探测超时（45s）")
 	}
-	return "", fmt.Errorf("连续 %d 个代理均被上游拦截: %w", proxyProbeMax, lastErr)
 }
 
 // probeAddr 经代理探测上游登录端点：正常返回 JSON（{"code":...}），
@@ -190,7 +212,7 @@ func probeAddr(addr string) bool {
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = http.ProxyURL(u)
-	hc := &http.Client{Transport: tr, Timeout: 6 * time.Second}
+	hc := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 	req, err := http.NewRequest(http.MethodPost, defaultBase+"/merchantApi/user/login",
 		strings.NewReader("{}"))
 	if err != nil {
