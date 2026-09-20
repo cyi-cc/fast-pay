@@ -33,7 +33,7 @@ const (
 	keyUpToken     = "up_token"
 	keyUpTokenAt   = "up_token_at"
 	keyUpProxyAPI  = "up_proxy_api"   // 代理取号 API，返回 {"data":[{"ip","port"}]}；空 = 直连
-	stickyTTL      = 25 * time.Minute // sticky 会话保守复用时长（供应商 sessTime 180min）
+	stickyTTL      = 4 * time.Minute  // sticky 会话复用时长（供应商会话 TTL 多为 5min）
 	tokenMaxAgeSec = 9 * 24 * 60 * 60 // JWT 约 10 天，9 天为安全上限
 )
 
@@ -205,8 +205,8 @@ func fetchWorkingAddr(api string) (string, error) {
 
 // probeAddr 经代理探测上游登录端点：正常返回 JSON（{"code":...}），
 // 被 WAF 拦截则返回 HTML 挑战页（以 '<' 开头）。
-func probeAddr(addr string) bool {
-	u, err := url.Parse("http://" + addr)
+func probeAddr(proxyURL string) bool {
+	u, err := url.Parse(proxyURL)
 	if err != nil {
 		return false
 	}
@@ -228,8 +228,9 @@ func probeAddr(addr string) bool {
 	return bytes.HasPrefix(bytes.TrimSpace(data), []byte("{"))
 }
 
-// fetchProxyAddr 调代理供应商 API 取一个出口地址。
-// 兼容 {"data":[{"ip":"1.2.3.4","port":18814}]} 与 {"data":["1.2.3.4:18814"]} 两种形态。
+// fetchProxyAddr 调代理供应商 API 取一个出口，返回归一化代理 URL。
+// 兼容：{"data":[{"ip","port"}]}（linkup）、{"data":["ip:port"]}、
+// 纯文本每行一条 ip:port[:user:pass]（iprocket，scheme 按 API 地址里 socks5 推断，默认 http）。
 func fetchProxyAddr(api string) (string, error) {
 	req, err := http.NewRequest(http.MethodGet, api, nil)
 	if err != nil {
@@ -251,7 +252,7 @@ func fetchProxyAddr(api string) (string, error) {
 		d := obj.Data[0]
 		port := strings.Trim(string(d.Port), `"`)
 		if d.IP != "" && port != "" {
-			return d.IP + ":" + port, nil
+			return normalizeProxyURL(d.IP+":"+port, api), nil
 		}
 	}
 	var arr struct {
@@ -259,10 +260,42 @@ func fetchProxyAddr(api string) (string, error) {
 	}
 	if err := json.Unmarshal(data, &arr); err == nil && len(arr.Data) > 0 {
 		if s := strings.TrimSpace(arr.Data[0]); s != "" {
-			return s, nil
+			return normalizeProxyURL(s, api), nil
+		}
+	}
+	// 纯文本响应：每行一个代理
+	for _, line := range strings.Split(string(data), "\n") {
+		if u := normalizeProxyURL(line, api); u != "" {
+			return u, nil
 		}
 	}
 	return "", fmt.Errorf("代理 API 未返回可用代理")
+}
+
+// normalizeProxyURL 把供应商返回的地址归一化为代理 URL：
+//
+//	http(s)://… / socks5://… → 原样
+//	ip:port:user:pass        → <scheme>://user:pass@ip:port
+//	ip:port                  → <scheme>://ip:port
+//
+// scheme 默认 http；取号 API 地址含 socks5 时用 socks5。
+func normalizeProxyURL(line, api string) string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return ""
+	}
+	if strings.Contains(line, "://") {
+		return line
+	}
+	scheme := "http"
+	if strings.Contains(strings.ToLower(api), "socks5") {
+		scheme = "socks5"
+	}
+	parts := strings.Split(line, ":")
+	if len(parts) == 4 {
+		return scheme + "://" + parts[2] + ":" + parts[3] + "@" + parts[0] + ":" + parts[1]
+	}
+	return scheme + "://" + line
 }
 
 // clientFor 取 HTTP 客户端：按模式取代理出口；未配置代理直连。
@@ -274,7 +307,7 @@ func (c *Client) clientFor(sticky bool) (*http.Client, error) {
 	if addr == "" {
 		return c.hc, nil
 	}
-	u, err := url.Parse("http://" + addr)
+	u, err := url.Parse(addr)
 	if err != nil {
 		return nil, fmt.Errorf("代理地址无效")
 	}
