@@ -1,4 +1,4 @@
-﻿# Fast Pay 编排：后端（内嵌 SQLite）+ 前端 nginx（宿主 4000 → 容器 4000）。
+# Fast Pay 编排：后端（内嵌 SQLite）+ 前端 nginx（宿主 4000 → 容器 4000）。
 #
 # 使用：
 #   docker compose up -d
