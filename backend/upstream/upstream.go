@@ -244,8 +244,8 @@ func (c *Client) refillWarm() {
 // fetchWorkingAddr 取号 + 探活：代理池部分出口被上游 WAF 标记（实测通过率约 1/15），
 // 8 个并发 worker 各自取号探活，任一返回 JSON 即胜出；上限 ~48 个号防止坏池死循环。
 func fetchWorkingAddr(api string) (string, error) {
-	const workers = 1 // 单并发即可：好池首个即过，避免对取号 API 的高频轰炸
-	const triesPerWorker = 20
+	const workers = 4 // 住宅池死节点多，单并发探活太慢；4 路折中取号压力与速度
+	const triesPerWorker = 8
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	found := make(chan string, 1)
