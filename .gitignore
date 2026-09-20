@@ -1,0 +1,24 @@
+# 依赖与构建产物
+**/node_modules
+**/dist
+backend/epay.exe
+
+# 本地运行产物（首次启动自动生成）
+backend/funpay.db*
+backend/config.json
+
+# 临时抓包/截图/对比目录
+.tmp-vivid/
+*.har
+*.png
+capture*.js
+cap_*.js
+shot*.js
+har_extract*.js
+temp_*.png
+
+# 编辑器/系统
+.idea/
+.vscode/
+*.log
+Thumbs.db

@@ -1,0 +1,52 @@
+# Fast Pay 编排：后端（内嵌 SQLite）+ 前端 nginx（宿主 4000 → 容器 4000）。
+#
+# 使用：
+#   docker compose up -d
+#   首次启动后端在 /data 卷内自动生成 config.json（默认密码 admin123，
+#   请尽快到「系统配置」页修改）。config.json 的 frontend_url 改成
+#   实际对外地址（如 http://<服务器IP>:4000），否则 submit.php 收银台跳转会指错。
+#
+# 镜像构建（仓库根执行）：
+#   后端   docker build -f backend/Dockerfile -t epay-backend .
+#   前端   docker build -t epay-web .          # compose 内已带 NGINX_CONF=compose.conf
+
+services:
+  server:
+    image: epay-backend:latest
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    mem_limit: 256m
+    volumes:
+      # 配置 + SQLite 持久化；禁止 docker compose down -v（会删卷）
+      - epay_data:/data
+    # 仅容器网络内可达（前端 nginx 反代）；调试时可映射 "127.0.0.1:9200:9200"
+    expose:
+      - "9200"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    image: epay-web:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # compose 网络版 conf：反代 server:9200（默认 conf 是 host 网络 127.0.0.1 版）
+      args:
+        NGINX_CONF: compose.conf
+    depends_on:
+      - server
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+    mem_limit: 128m
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  epay_data:

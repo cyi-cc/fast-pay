@@ -1,0 +1,16 @@
+**/node_modules
+**/dist
+.git
+.tmp-vivid
+
+# 本地运行产物
+backend/epay.exe
+backend/funpay.db*
+backend/config.json
+
+# 抓包/截图等临时文件
+*.har
+*.png
+capture*.js
+cap_*.js
+shot*.js
