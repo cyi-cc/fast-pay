@@ -84,13 +84,6 @@
               @keyup.enter="externalLogin"
             />
           </n-form-item>
-          <n-form-item label="代理 API（选填）" path="proxyApi">
-            <n-input
-              v-model:value="externalForm.proxyApi"
-              placeholder="代理取号接口地址，留空则直连"
-              @keyup.enter="externalLogin"
-            />
-          </n-form-item>
           <div v-if="externalError" class="login-error">{{ externalError }}</div>
           <n-button type="primary" block :loading="externalLoading" @click="externalLogin">登录</n-button>
         </n-form>
@@ -194,6 +187,28 @@
         </div>
       </div>
     </section>
+
+    <!-- ===== 代理配置（管理员） ===== -->
+    <section v-if="store.isAdmin" class="card detail-card upstream-card">
+      <div class="card-head">
+        <div class="head-icon tone-blue">
+          <n-icon :component="GlobeOutline" :size="16" />
+        </div>
+        <div class="head-main">
+          <h3 class="head-title">代理配置</h3>
+          <p class="head-desc">上游请求经代理出口，留空则直连</p>
+        </div>
+      </div>
+
+      <div class="upstream-body">
+        <div class="stock-row">
+          <span class="stock-label">代理 API</span>
+          <n-input v-model:value="proxyApi" class="stock-input" size="small" placeholder="代理取号接口地址" aria-label="代理 API" />
+          <n-button size="small" secondary :loading="proxySaving" @click="saveProxy">保存</n-button>
+          <span class="stock-hint">商户操作固定一个 IP，下单自动取新 IP</span>
+        </div>
+      </div>
+    </section>
       </div>
     </div>
 
@@ -231,7 +246,7 @@
 <script setup>
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { ShieldCheckmarkOutline, KeyOutline, CopyOutline, LogInOutline, CheckmarkCircleOutline, CubeOutline, CardOutline, CloseOutline, LogoWechat, TimeOutline } from '@vicons/ionicons5'
+import { ShieldCheckmarkOutline, KeyOutline, CopyOutline, LogInOutline, CheckmarkCircleOutline, CubeOutline, CardOutline, CloseOutline, LogoWechat, TimeOutline, GlobeOutline } from '@vicons/ionicons5'
 import client, { call } from '../../api'
 import { useUserStore } from '../../stores/user'
 import { fen2yuan } from '../../utils/format'
@@ -248,7 +263,7 @@ const externalFormRef = ref(null)
 const externalLoading = ref(false)
 const externalError = ref('')
 const externalResult = ref(null)
-const externalForm = reactive({ account: '', password: '', proxyApi: '' })
+const externalForm = reactive({ account: '', password: '' })
 const externalRules = {
   account: { required: true, message: '请输入登录账号', trigger: ['blur', 'input'] },
   password: {
@@ -262,6 +277,8 @@ const externalRules = {
 const up = ref({ configured: 0, username: '', nickname: '', shop: '', goodsKey: '', goodsID: 0, goodsName: '', unitPrice: 0, stockAmount: 100000, upAvailable: 0, upFrozen: 0, walletReady: 0, tokenAge: -1, proxyApi: '' })
 const stockAmount = ref('')
 const stockSaving = ref(false)
+const proxyApi = ref('')
+const proxySaving = ref(false)
 
 // 测试支付
 const testMoney = ref('')
@@ -354,9 +371,9 @@ async function loadUpstream() {
     const st = await call(client.upstreamSvc.status())
     up.value = st
     stockAmount.value = fen2yuan(st.stockAmount) || ''
+    proxyApi.value = st.proxyApi || ''
     if (st.configured) {
       externalForm.account = st.username
-      externalForm.proxyApi = st.proxyApi || ''
       externalResult.value = { account: st.username, nickname: st.nickname, shop: st.shop }
     }
   } catch {
@@ -396,7 +413,6 @@ async function externalLogin() {
     const st = await call(client.upstreamSvc.saveAccount({
       username: externalForm.account.trim(),
       password: externalForm.password,
-      proxyAPI: externalForm.proxyApi.trim(),
     }))
     up.value = st
     externalResult.value = { account: st.username, nickname: st.nickname, shop: st.shop }
@@ -414,7 +430,6 @@ function resetExternalLogin() {
   externalError.value = ''
   externalForm.account = up.value.username || ''
   externalForm.password = ''
-  externalForm.proxyApi = up.value.proxyApi || ''
 }
 
 async function refreshAutoGoods() {
@@ -438,6 +453,19 @@ async function saveStock() {
     message.error(e.message)
   } finally {
     stockSaving.value = false
+  }
+}
+
+async function saveProxy() {
+  proxySaving.value = true
+  try {
+    up.value = await call(client.upstreamSvc.setProxy({ proxyAPI: proxyApi.value.trim() }))
+    proxyApi.value = up.value.proxyApi || ''
+    message.success(up.value.proxyApi ? '代理已启用' : '已切回直连')
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    proxySaving.value = false
   }
 }
 

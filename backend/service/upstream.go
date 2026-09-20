@@ -264,18 +264,14 @@ func (s *UpstreamSvc) SaveAccount(dto UpstreamAccountDto) (UpstreamStatusView, e
 		}
 		password = pwd
 	}
-	// 代理 API 先落库再登录：掩码值提交 = 保持不变；登录请求即走新出口
+	// 代理 API：提交了非掩码新值才更新（留空不动现有配置，单独管理见 SetProxy）
 	curProxy := s.Db.SettingStr(keyUpProxyAPI, "")
-	proxyAPI := strings.TrimSpace(dto.ProxyAPI)
-	if proxyAPI == maskProxyAPI(curProxy) {
-		proxyAPI = curProxy
-	}
-	if proxyAPI != curProxy {
-		if err := s.Db.SetSetting(keyUpProxyAPI, proxyAPI); err != nil {
+	if v := strings.TrimSpace(dto.ProxyAPI); v != "" && v != maskProxyAPI(curProxy) && v != curProxy {
+		if err := s.Db.SetSetting(keyUpProxyAPI, v); err != nil {
 			return UpstreamStatusView{}, fun.Error(5000, "保存配置失败")
 		}
 	}
-	s.Up.SetProxyAPI(proxyAPI)
+	s.Up.SetProxyAPI(s.Db.SettingStr(keyUpProxyAPI, ""))
 	if err := s.Up.SetCredentials(dto.Username, password); err != nil {
 		return UpstreamStatusView{}, err
 	}
@@ -348,6 +344,26 @@ func (s *UpstreamSvc) BindGoods(dto BindGoodsDto) (UpstreamStatusView, error) {
 			return UpstreamStatusView{}, fun.Error(5000, "保存配置失败")
 		}
 	}
+	return s.Status()
+}
+
+type UpstreamProxyDto struct {
+	ProxyAPI string // 代理取号 API；掩码值 = 保持不变，空 = 清除
+}
+
+// SetProxy 单独保存代理取号 API（无需重新登录），立即生效。
+func (s *UpstreamSvc) SetProxy(dto UpstreamProxyDto) (UpstreamStatusView, error) {
+	cur := s.Db.SettingStr(keyUpProxyAPI, "")
+	v := strings.TrimSpace(dto.ProxyAPI)
+	if v == maskProxyAPI(cur) {
+		v = cur
+	}
+	if v != cur {
+		if err := s.Db.SetSetting(keyUpProxyAPI, v); err != nil {
+			return UpstreamStatusView{}, fun.Error(5000, "保存失败")
+		}
+	}
+	s.Up.SetProxyAPI(v)
 	return s.Status()
 }
 

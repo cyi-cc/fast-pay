@@ -8,6 +8,7 @@ import type upstreamCardPage from "./upstreamCardPage";
 import type upstreamCardQueryDto from "./upstreamCardQueryDto";
 import type upstreamGoodsPage from "./upstreamGoodsPage";
 import type upstreamGoodsQueryDto from "./upstreamGoodsQueryDto";
+import type upstreamProxyDto from "./upstreamProxyDto";
 import type upstreamStatusView from "./upstreamStatusView";
 import type upstreamStockDto from "./upstreamStockDto";
 
@@ -30,6 +31,9 @@ export default class upstreamSvc {
   }
   async saveAccount(dto:upstreamAccountDto, options?: RequestOptions): Promise<result<upstreamStatusView>> {
     return await this.client.request<upstreamStatusView>("upstreamSvc", "saveAccount", dto, options)
+  }
+  async setProxy(dto:upstreamProxyDto, options?: RequestOptions): Promise<result<upstreamStatusView>> {
+    return await this.client.request<upstreamStatusView>("upstreamSvc", "setProxy", dto, options)
   }
   async setStock(dto:upstreamStockDto, options?: RequestOptions): Promise<result<upstreamStatusView>> {
     return await this.client.request<upstreamStatusView>("upstreamSvc", "setStock", dto, options)
