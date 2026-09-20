@@ -138,6 +138,11 @@ WHERE id = @id;
 UPDATE orders SET notified = 0, notify_attempts = 0, updated_at = @now
 WHERE id = @id;
 
+-- name: ListUnnotifiedPaidOrders :many
+SELECT trade_no FROM orders
+WHERE status = 1 AND notified = 0 AND notify_url != '' AND notify_attempts < 5
+ORDER BY id DESC LIMIT @lim;
+
 -- name: CloseExpiredOrders :execrows
 UPDATE orders SET status = 3, updated_at = @now
 WHERE status = 0 AND expired_at > 0 AND expired_at < @now;

@@ -544,6 +544,18 @@ type UpstreamPoller struct {
 func (p *UpstreamPoller) New() error {
 	// 商户凭据与令牌由 upstream.Client.New 从设置中恢复，这里只启动轮询
 	go p.loop()
+	// 重启兜底：上次进程退出时还在退避重试的已支付未通知订单重新入队
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		nos, err := p.Db.Q.ListUnnotifiedPaidOrders(ctx, 50)
+		if err != nil {
+			return
+		}
+		for _, tn := range nos {
+			p.Notify.OnPaid(tn)
+		}
+	}()
 	return nil
 }
 

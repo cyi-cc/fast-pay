@@ -1375,6 +1375,35 @@ func (q *Queries) ListSettlesByUser(ctx context.Context, arg ListSettlesByUserPa
 	return items, nil
 }
 
+const listUnnotifiedPaidOrders = `-- name: ListUnnotifiedPaidOrders :many
+SELECT trade_no FROM orders
+WHERE status = 1 AND notified = 0 AND notify_url != '' AND notify_attempts < 5
+ORDER BY id DESC LIMIT ?1
+`
+
+func (q *Queries) ListUnnotifiedPaidOrders(ctx context.Context, lim int64) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listUnnotifiedPaidOrders, lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var trade_no string
+		if err := rows.Scan(&trade_no); err != nil {
+			return nil, err
+		}
+		items = append(items, trade_no)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUsers = `-- name: ListUsers :many
 SELECT id, username, email, role, status, balance, created_at
 FROM users

@@ -99,24 +99,67 @@ func (n *Notifier) attempt(o db.Order) bool {
 	if err != nil {
 		return false
 	}
-	target := BuildSignedURL(o.NotifyUrl, NotifyParams(o, app.AppID), app.AppKey)
+	params := NotifyParams(o, app.AppID)
+	params["sign"] = domain.Sign(params, app.AppKey)
+	params["sign_type"] = "MD5"
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(target)
+	// 先 POST form 后 GET 兜底：不同商户接收端约定不一，任一返回 success 即确认
+	if n.try(client, o.NotifyUrl, params) {
+		return n.confirm(o)
+	}
+	if n.tryGet(client, o.NotifyUrl, params) {
+		return n.confirm(o)
+	}
+	return false
+}
+
+// try POST application/x-www-form-urlencoded 通知。
+func (n *Notifier) try(client *http.Client, target string, params map[string]string) bool {
+	form := url.Values{}
+	for k, v := range params {
+		form.Set(k, v)
+	}
+	resp, err := client.Post(target, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
-	if resp.StatusCode == http.StatusOK && strings.TrimSpace(string(body)) == "success" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = n.Db.Q.MarkOrderNotified(ctx, db.MarkOrderNotifiedParams{
-			Attempts: o.NotifyAttempts + 1, Now: time.Now().Unix(), ID: o.ID,
-		})
-		cancel()
-		log.Printf("[notify] %s 商户确认成功", o.TradeNo)
-		return true
+	return okBody(resp)
+}
+
+func (n *Notifier) tryGet(client *http.Client, target string, params map[string]string) bool {
+	q := url.Values{}
+	for k, v := range params {
+		q.Set(k, v)
 	}
-	return false
+	sep := "?"
+	if strings.Contains(target, "?") {
+		sep = "&"
+	}
+	resp, err := client.Get(target + sep + q.Encode())
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return okBody(resp)
+}
+
+func okBody(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+	return strings.TrimSpace(string(body)) == "success"
+}
+
+func (n *Notifier) confirm(o db.Order) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = n.Db.Q.MarkOrderNotified(ctx, db.MarkOrderNotifiedParams{
+		Attempts: o.NotifyAttempts + 1, Now: time.Now().Unix(), ID: o.ID,
+	})
+	log.Printf("[notify] %s 商户确认成功", o.TradeNo)
+	return true
 }
 
 func nextDelayLabel(i int) string {
