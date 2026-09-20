@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"epay/database"
 	"epay/domain"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -31,6 +32,8 @@ const (
 	keyEncKey      = "enc_key"
 	keyUpToken     = "up_token"
 	keyUpTokenAt   = "up_token_at"
+	keyUpProxyAPI  = "up_proxy_api"   // 代理取号 API，返回 {"data":[{"ip","port"}]}；空 = 直连
+	stickyTTL      = 25 * time.Minute // sticky 会话保守复用时长（供应商 sessTime 180min）
 	tokenMaxAgeSec = 9 * 24 * 60 * 60 // JWT 约 10 天，9 天为安全上限
 )
 
@@ -67,6 +70,11 @@ type Client struct {
 	channelAt int64
 
 	orderMu sync.Mutex // 串行化「查库存→补库存→下单」，避免并发订单抢同一批卡
+
+	proxyMu    sync.Mutex
+	proxyAPI   string    // 代理取号 API 地址
+	stickyAddr string    // sticky 会话当前代理（ip:port）
+	stickyAt   time.Time // sticky 代理获取时间
 }
 
 // OrderLock 取下单互斥锁，返回解锁函数。
@@ -96,7 +104,132 @@ func (c *Client) New() error {
 			c.token, c.loggedAt = tok, at
 		}
 	}
+	c.proxyAPI = c.Db.SettingStr(keyUpProxyAPI, "")
 	return nil
+}
+
+// ---------- 代理 ----------
+// 机房 IP 会被上游 WAF 拦截，出站请求可经代理池出口：
+// sticky=true（登录/加卡/查单等商户操作）复用同一 IP，false（下单/取码）每次取新代理。
+
+// SetProxyAPI 更新代理取号 API；空串 = 直连。变更后丢弃 sticky 会话。
+func (c *Client) SetProxyAPI(api string) {
+	c.proxyMu.Lock()
+	c.proxyAPI = strings.TrimSpace(api)
+	c.stickyAddr, c.stickyAt = "", time.Time{}
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) proxyEnabled() bool {
+	c.proxyMu.Lock()
+	defer c.proxyMu.Unlock()
+	return c.proxyAPI != ""
+}
+
+// dropSticky sticky 代理失效（WAF 拦截/连接失败）时丢弃，下次重新取号。
+func (c *Client) dropSticky() {
+	c.proxyMu.Lock()
+	c.stickyAddr, c.stickyAt = "", time.Time{}
+	c.proxyMu.Unlock()
+}
+
+// proxyAddr 取代理地址（ip:port）：sticky 复用缓存，rotating 每次取新；未配置返回空。
+func (c *Client) proxyAddr(sticky bool) (string, error) {
+	c.proxyMu.Lock()
+	api := c.proxyAPI
+	if sticky && c.stickyAddr != "" && time.Since(c.stickyAt) < stickyTTL {
+		addr := c.stickyAddr
+		c.proxyMu.Unlock()
+		return addr, nil
+	}
+	c.proxyMu.Unlock()
+	if api == "" {
+		return "", nil
+	}
+	addr, err := fetchProxyAddr(api)
+	if err != nil {
+		return "", err
+	}
+	if sticky {
+		c.proxyMu.Lock()
+		c.stickyAddr, c.stickyAt = addr, time.Now()
+		c.proxyMu.Unlock()
+	}
+	return addr, nil
+}
+
+// fetchProxyAddr 调代理供应商 API 取一个出口地址。
+// 兼容 {"data":[{"ip":"1.2.3.4","port":18814}]} 与 {"data":["1.2.3.4:18814"]} 两种形态。
+func fetchProxyAddr(api string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, api, nil)
+	if err != nil {
+		return "", fmt.Errorf("代理 API 地址无效")
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("代理取号失败: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var obj struct {
+		Data []struct {
+			IP   string          `json:"ip"`
+			Port json.RawMessage `json:"port"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &obj); err == nil && len(obj.Data) > 0 {
+		d := obj.Data[0]
+		port := strings.Trim(string(d.Port), `"`)
+		if d.IP != "" && port != "" {
+			return d.IP + ":" + port, nil
+		}
+	}
+	var arr struct {
+		Data []string `json:"data"`
+	}
+	if err := json.Unmarshal(data, &arr); err == nil && len(arr.Data) > 0 {
+		if s := strings.TrimSpace(arr.Data[0]); s != "" {
+			return s, nil
+		}
+	}
+	return "", fmt.Errorf("代理 API 未返回可用代理")
+}
+
+// clientFor 取 HTTP 客户端：按模式取代理出口；未配置代理直连。
+func (c *Client) clientFor(sticky bool) (*http.Client, error) {
+	addr, err := c.proxyAddr(sticky)
+	if err != nil {
+		return nil, err
+	}
+	if addr == "" {
+		return c.hc, nil
+	}
+	u, err := url.Parse("http://" + addr)
+	if err != nil {
+		return nil, fmt.Errorf("代理地址无效")
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = http.ProxyURL(u)
+	return &http.Client{Transport: tr, Timeout: 20 * time.Second}, nil
+}
+
+// do 执行请求并读回响应体；WAF 返回 HTML 挑战页时作废 sticky 会话。
+func (c *Client) do(req *http.Request, sticky bool) ([]byte, int, error) {
+	hc, err := c.clientFor(sticky)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		c.dropSticky()
+		return nil, 0, fmt.Errorf("上游请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("<")) {
+		c.dropSticky()
+	}
+	return data, resp.StatusCode, nil
 }
 
 // ---------- 会话 ----------
@@ -155,7 +288,7 @@ func (c *Client) login() (string, error) {
 		MerchantToken string `json:"merchant_token"`
 	}
 	if err := c.post(context.Background(), "/merchantApi/user/login",
-		map[string]any{"username": u, "password": p}, "", &out); err != nil {
+		map[string]any{"username": u, "password": p}, "", &out, true); err != nil {
 		return "", err
 	}
 	if out.MerchantToken == "" {
@@ -195,7 +328,7 @@ func (c *Client) merchantPost(ctx context.Context, path string, body, out any) e
 	if err != nil {
 		return err
 	}
-	err = c.post(ctx, path, body, tok, out)
+	err = c.post(ctx, path, body, tok, out, true)
 	if err != ErrAuth {
 		return err
 	}
@@ -210,12 +343,27 @@ func (c *Client) merchantPost(ctx context.Context, path string, body, out any) e
 	c.mu.Lock()
 	tok = c.token
 	c.mu.Unlock()
-	return c.post(ctx, path, body, tok, out)
+	return c.post(ctx, path, body, tok, out, true)
 }
 
 // ---------- 底层请求 ----------
 
-func (c *Client) post(ctx context.Context, path string, body any, merchantToken string, out any) error {
+// post 商户/买家 POST：sticky=true 复用固定代理 IP（商户会话），false 每次取新代理（下单）。
+// 配置了代理时，网络错误或非 JSON 响应（WAF 拦截）自动换代理重试一次；业务错误不重试。
+func (c *Client) post(ctx context.Context, path string, body any, merchantToken string, out any, sticky bool) error {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		err := c.postOnce(ctx, path, body, merchantToken, out, sticky)
+		var ae *apiError
+		if err == nil || errors.Is(err, ErrAuth) || errors.As(err, &ae) || !c.proxyEnabled() {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+func (c *Client) postOnce(ctx context.Context, path string, body any, merchantToken string, out any, sticky bool) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -228,18 +376,21 @@ func (c *Client) post(ctx context.Context, path string, body any, merchantToken 
 	if merchantToken != "" {
 		req.Header.Set("Merchant-Token", merchantToken)
 	}
-	resp, err := c.hc.Do(req)
+	data, status, err := c.do(req, sticky)
 	if err != nil {
-		return fmt.Errorf("上游请求失败: %w", err)
+		return err
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return ErrAuth
 	}
 	var env envelope
 	if err := json.Unmarshal(data, &env); err != nil {
-		return fmt.Errorf("上游响应解析失败: %w", err)
+		// 非 JSON 响应（WAF 拦截页 / 跳转页等）：带上状态码与片段方便定位
+		snippet := strings.TrimSpace(string(data))
+		if len(snippet) > 120 {
+			snippet = snippet[:120]
+		}
+		return fmt.Errorf("上游响应解析失败(http %d): %w [%s]", status, err, snippet)
 	}
 	if env.Code != 1 {
 		msg := env.Msg
@@ -478,7 +629,7 @@ func (c *Client) WechatChannelID(ctx context.Context, shop string) (int64, error
 	}
 	c.mu.Unlock()
 	var list []Channel
-	if err := c.post(ctx, "/shopApi/Shop/getUserChannel", map[string]any{"token": shop}, "", &list); err != nil {
+	if err := c.post(ctx, "/shopApi/Shop/getUserChannel", map[string]any{"token": shop}, "", &list, true); err != nil {
 		return 0, err
 	}
 	var fallback int64
@@ -510,7 +661,7 @@ func (c *Client) GoodsPrice(ctx context.Context, goodsKey string, quantity, chan
 	}
 	err := c.post(ctx, "/shopApi/Shop/getGoodsPrice", map[string]any{
 		"goods_key": goodsKey, "quantity": quantity, "coupon_code": "", "channel_id": channelID,
-	}, "", &out)
+	}, "", &out, true)
 	if err != nil {
 		return 0, err
 	}
@@ -538,7 +689,7 @@ func (c *Client) CreateOrder(ctx context.Context, goodsKey string, quantity, cha
 		"channel_id": channelID, "contact": contact, "query_password": queryPwd,
 		"select_cards_ids": []any{},
 		"extend":           map[string]any{"juuid": randHex(12)},
-	}, "", &raw)
+	}, "", &raw, false) // 下单每次换新代理
 	if err != nil {
 		return PayOrderResult{}, err
 	}
@@ -553,12 +704,10 @@ func (c *Client) FetchQRCode(ctx context.Context, tradeNo string) (string, error
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.hc.Do(req)
+	body, _, err := c.do(req, false) // 取码与下单同链路，每次新代理
 	if err != nil {
 		return "", fmt.Errorf("获取收银台页面失败: %w", err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	m := qrStrRe.FindSubmatch(body)
 	if len(m) < 2 {
 		return "", fmt.Errorf("收银台页面未找到二维码")
@@ -579,7 +728,7 @@ var qrStrRe = regexp.MustCompile(`generateQrcode\.html\?str=([^"'<>\s&]+)`)
 // OrderPaid 查询上游订单是否已支付。
 func (c *Client) OrderPaid(ctx context.Context, tradeNo string) (bool, error) {
 	// Pay/query：未支付时 code=0 msg="not pay"，已支付 code=1
-	raw, err := c.postRaw(ctx, "/shopApi/Pay/query", map[string]any{"trade_no": tradeNo})
+	raw, err := c.postRaw(ctx, "/shopApi/Pay/query", map[string]any{"trade_no": tradeNo}, true)
 	if err != nil {
 		return false, err
 	}
@@ -598,14 +747,26 @@ func (c *Client) OrderCards(ctx context.Context, tradeNo string) ([]string, erro
 			Cards []string `json:"cards"`
 		} `json:"response"`
 	}
-	if err := c.post(ctx, "/shopApi/Order/info", map[string]any{"trade_no": tradeNo, "dump": 1}, "", &out); err != nil {
+	if err := c.post(ctx, "/shopApi/Order/info", map[string]any{"trade_no": tradeNo, "dump": 1}, "", &out, true); err != nil {
 		return nil, err
 	}
 	return out.Response.Cards, nil
 }
 
-// postRaw 返回原始响应体（用于 code!=1 也是合法应答的接口）。
-func (c *Client) postRaw(ctx context.Context, path string, body any) ([]byte, error) {
+// postRaw 返回原始响应体（用于 code!=1 也是合法应答的接口）。代理故障自动重试一次。
+func (c *Client) postRaw(ctx context.Context, path string, body any, sticky bool) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		data, err := c.postRawOnce(ctx, path, body, sticky)
+		if err == nil || !c.proxyEnabled() {
+			return data, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (c *Client) postRawOnce(ctx context.Context, path string, body any, sticky bool) ([]byte, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -615,12 +776,8 @@ func (c *Client) postRaw(ctx context.Context, path string, body any) ([]byte, er
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("上游请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, _, err := c.do(req, sticky)
+	return data, err
 }
 
 // ---------- 工具 ----------

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cyi-cc/fun"
 
@@ -32,6 +33,7 @@ const (
 	keyUpGoodsName   = "up_goods_name"
 	keyUpUnitPrice   = "up_unit_price"   // 分
 	keyUpStockAmount = "up_stock_amount" // 库存目标（分）
+	keyUpProxyAPI    = "up_proxy_api"    // 代理取号 API；空 = 直连
 	keyEncKey        = "enc_key"         // 本地加密密钥材料
 )
 
@@ -53,16 +55,18 @@ type UpstreamStatusView struct {
 	GoodsKey    string
 	GoodsID     int64
 	GoodsName   string
-	UnitPrice   int64 // 分
-	StockAmount int64 // 库存目标（分），默认 ¥1000
-	UpAvailable int64 // 上游可提现余额（分）
-	UpFrozen    int64 // 上游冻结金额（分）
-	WalletReady int64 // 钱包数据是否读取成功
+	UnitPrice   int64  // 分
+	StockAmount int64  // 库存目标（分），默认 ¥1000
+	UpAvailable int64  // 上游可提现余额（分）
+	UpFrozen    int64  // 上游冻结金额（分）
+	WalletReady int64  // 钱包数据是否读取成功
+	ProxyAPI    string // 代理取号 API（掩码回显）
 }
 
 type UpstreamAccountDto struct {
 	Username string
 	Password string
+	ProxyAPI string // 代理取号 API；掩码值 = 保持不变，空 = 清除
 }
 
 type UpstreamGoodsQueryDto struct {
@@ -133,6 +137,7 @@ func (s *UpstreamSvc) Status() (UpstreamStatusView, error) {
 		GoodsName:   s.Db.SettingStr(keyUpGoodsName, ""),
 		UnitPrice:   s.Db.SettingInt(keyUpUnitPrice, 0),
 		StockAmount: s.Db.SettingInt(keyUpStockAmount, 100000),
+		ProxyAPI:    maskProxyAPI(s.Db.SettingStr(keyUpProxyAPI, "")),
 	}
 	if v.Username != "" {
 		v.Configured = 1
@@ -259,6 +264,18 @@ func (s *UpstreamSvc) SaveAccount(dto UpstreamAccountDto) (UpstreamStatusView, e
 		}
 		password = pwd
 	}
+	// 代理 API 先落库再登录：掩码值提交 = 保持不变；登录请求即走新出口
+	curProxy := s.Db.SettingStr(keyUpProxyAPI, "")
+	proxyAPI := strings.TrimSpace(dto.ProxyAPI)
+	if proxyAPI == maskProxyAPI(curProxy) {
+		proxyAPI = curProxy
+	}
+	if proxyAPI != curProxy {
+		if err := s.Db.SetSetting(keyUpProxyAPI, proxyAPI); err != nil {
+			return UpstreamStatusView{}, fun.Error(5000, "保存配置失败")
+		}
+	}
+	s.Up.SetProxyAPI(proxyAPI)
 	if err := s.Up.SetCredentials(dto.Username, password); err != nil {
 		return UpstreamStatusView{}, err
 	}
@@ -473,6 +490,14 @@ func (s *UpstreamSvc) TestPay(dto TestPayDto) (TestPayResult, error) {
 		TradeNo: out.TradeNo, OutTradeNo: outTradeNo, Money: money,
 		Quantity: quantity, Qrcode: out.Qrcode, PayURL: out.PayURL,
 	}, nil
+}
+
+// maskProxyAPI 代理 API 回显掩码：提交回掩码值表示「保持不变」（同 vivid 站点设置惯例）。
+func maskProxyAPI(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	return strings.Repeat("•", min(utf8.RuneCountInString(raw), 40))
 }
 
 func (s *UpstreamSvc) encrypt(plain string) (string, error) {

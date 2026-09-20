@@ -84,6 +84,13 @@
               @keyup.enter="externalLogin"
             />
           </n-form-item>
+          <n-form-item label="代理 API（选填）" path="proxyApi">
+            <n-input
+              v-model:value="externalForm.proxyApi"
+              placeholder="代理取号接口地址，留空则直连"
+              @keyup.enter="externalLogin"
+            />
+          </n-form-item>
           <div v-if="externalError" class="login-error">{{ externalError }}</div>
           <n-button type="primary" block :loading="externalLoading" @click="externalLogin">登录</n-button>
         </n-form>
@@ -241,7 +248,7 @@ const externalFormRef = ref(null)
 const externalLoading = ref(false)
 const externalError = ref('')
 const externalResult = ref(null)
-const externalForm = reactive({ account: '', password: '' })
+const externalForm = reactive({ account: '', password: '', proxyApi: '' })
 const externalRules = {
   account: { required: true, message: '请输入登录账号', trigger: ['blur', 'input'] },
   password: {
@@ -252,7 +259,7 @@ const externalRules = {
 }
 
 // 上游对接状态（仅管理员可用 upstreamSvc）
-const up = ref({ configured: 0, username: '', nickname: '', shop: '', goodsKey: '', goodsID: 0, goodsName: '', unitPrice: 0, stockAmount: 100000, upAvailable: 0, upFrozen: 0, walletReady: 0, tokenAge: -1 })
+const up = ref({ configured: 0, username: '', nickname: '', shop: '', goodsKey: '', goodsID: 0, goodsName: '', unitPrice: 0, stockAmount: 100000, upAvailable: 0, upFrozen: 0, walletReady: 0, tokenAge: -1, proxyApi: '' })
 const stockAmount = ref('')
 const stockSaving = ref(false)
 
@@ -349,6 +356,7 @@ async function loadUpstream() {
     stockAmount.value = fen2yuan(st.stockAmount) || ''
     if (st.configured) {
       externalForm.account = st.username
+      externalForm.proxyApi = st.proxyApi || ''
       externalResult.value = { account: st.username, nickname: st.nickname, shop: st.shop }
     }
   } catch {
@@ -388,6 +396,7 @@ async function externalLogin() {
     const st = await call(client.upstreamSvc.saveAccount({
       username: externalForm.account.trim(),
       password: externalForm.password,
+      proxyAPI: externalForm.proxyApi.trim(),
     }))
     up.value = st
     externalResult.value = { account: st.username, nickname: st.nickname, shop: st.shop }
@@ -405,6 +414,7 @@ function resetExternalLogin() {
   externalError.value = ''
   externalForm.account = up.value.username || ''
   externalForm.password = ''
+  externalForm.proxyApi = up.value.proxyApi || ''
 }
 
 async function refreshAutoGoods() {

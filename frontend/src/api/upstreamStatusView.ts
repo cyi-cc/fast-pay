@@ -12,4 +12,5 @@ export default interface upstreamStatusView {
   upAvailable:number
   upFrozen:number
   walletReady:number
+  proxyAPI:string
 }
