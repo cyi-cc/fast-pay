@@ -75,6 +75,15 @@ type Client struct {
 	proxyAPI   string    // 代理取号 API 地址
 	stickyAddr string    // sticky 会话当前代理（ip:port）
 	stickyAt   time.Time // sticky 代理获取时间
+
+	warmMu  sync.Mutex
+	warm    []warmProxy // 已探活的 rotating 代理热池：下单直接取，异步补足
+	warming bool        // 后台补池去重
+}
+
+type warmProxy struct {
+	Addr string
+	At   time.Time
 }
 
 // OrderLock 取下单互斥锁，返回解锁函数。
@@ -105,6 +114,7 @@ func (c *Client) New() error {
 		}
 	}
 	c.proxyAPI = c.Db.SettingStr(keyUpProxyAPI, "")
+	c.refillWarm() // 启动即后台预热代理池
 	return nil
 }
 
@@ -112,12 +122,16 @@ func (c *Client) New() error {
 // 机房 IP 会被上游 WAF 拦截，出站请求可经代理池出口：
 // sticky=true（登录/加卡/查单等商户操作）复用同一 IP，false（下单/取码）每次取新代理。
 
-// SetProxyAPI 更新代理取号 API；空串 = 直连。变更后丢弃 sticky 会话。
+// SetProxyAPI 更新代理取号 API；空串 = 直连。变更后丢弃 sticky 会话与热池并触发预热。
 func (c *Client) SetProxyAPI(api string) {
 	c.proxyMu.Lock()
 	c.proxyAPI = strings.TrimSpace(api)
 	c.stickyAddr, c.stickyAt = "", time.Time{}
 	c.proxyMu.Unlock()
+	c.warmMu.Lock()
+	c.warm = nil
+	c.warmMu.Unlock()
+	c.refillWarm()
 }
 
 func (c *Client) proxyEnabled() bool {
@@ -146,6 +160,12 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 	if api == "" {
 		return "", nil
 	}
+	if !sticky {
+		// rotating：优先取后台热池里已探活的代理，没有才现场取号探活
+		if addr := c.popWarm(); addr != "" {
+			return addr, nil
+		}
+	}
 	// 代理池部分出口已被上游 WAF 标记：取号后先探活，被拦就换，直到拿到可用出口
 	addr, err := fetchWorkingAddr(api)
 	if err != nil {
@@ -157,6 +177,68 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 		c.proxyMu.Unlock()
 	}
 	return addr, nil
+}
+
+// 热池容量与保鲜时长：供应商会话 TTL 多为 5min，过期代理弹出即弃
+const (
+	warmSize = 3
+	warmTTL  = 3 * time.Minute
+)
+
+// popWarm 从热池取一个已探活代理；过期条目丢弃。取空时后台补池。
+func (c *Client) popWarm() string {
+	c.warmMu.Lock()
+	for len(c.warm) > 0 {
+		p := c.warm[0]
+		c.warm = c.warm[1:]
+		if time.Since(p.At) < warmTTL {
+			c.warmMu.Unlock()
+			c.refillWarm()
+			return p.Addr
+		}
+	}
+	c.warmMu.Unlock()
+	c.refillWarm()
+	return ""
+}
+
+// refillWarm 后台补池到 warmSize；并发/重复调用去重。
+func (c *Client) refillWarm() {
+	c.proxyMu.Lock()
+	api := c.proxyAPI
+	c.proxyMu.Unlock()
+	if api == "" {
+		return
+	}
+	c.warmMu.Lock()
+	if c.warming {
+		c.warmMu.Unlock()
+		return
+	}
+	c.warming = true
+	c.warmMu.Unlock()
+	go func() {
+		defer func() {
+			c.warmMu.Lock()
+			c.warming = false
+			c.warmMu.Unlock()
+		}()
+		for {
+			c.warmMu.Lock()
+			n := len(c.warm)
+			c.warmMu.Unlock()
+			if n >= warmSize {
+				return
+			}
+			addr, err := fetchWorkingAddr(api)
+			if err != nil {
+				return // 池子暂时不可用，下次取用再试
+			}
+			c.warmMu.Lock()
+			c.warm = append(c.warm, warmProxy{Addr: addr, At: time.Now()})
+			c.warmMu.Unlock()
+		}
+	}()
 }
 
 // fetchWorkingAddr 取号 + 探活：代理池部分出口被上游 WAF 标记（实测通过率约 1/15），
