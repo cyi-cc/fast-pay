@@ -295,6 +295,10 @@ func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey stri
 	} else if err != nil {
 		return errors.New("上游库存查询失败：" + err.Error())
 	}
+	// 一笔订单的下单+取码固定同一个已探活出口：省一次取号探活，同一 IP 也更自然
+	if addr, perr := e.Up.OrderProxy(ctx); perr == nil && addr != "" {
+		ctx = upstream.WithPinnedProxy(ctx, addr)
+	}
 	contact, queryPwd := upstream.RandContact(), upstream.RandQueryPwd()
 	res, err := e.Up.CreateOrder(ctx, goodsKey, quantity, channelID, contact, queryPwd)
 	if err != nil {

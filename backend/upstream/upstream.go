@@ -79,6 +79,8 @@ type Client struct {
 	warmMu  sync.Mutex
 	warm    []warmProxy // 已探活的 rotating 代理热池：下单直接取，异步补足
 	warming bool        // 后台补池去重
+
+	hcCache sync.Map // proxyURL → *http.Client：同出口请求复用 keep-alive 连接
 }
 
 type warmProxy struct {
@@ -131,6 +133,7 @@ func (c *Client) SetProxyAPI(api string) {
 	c.warmMu.Lock()
 	c.warm = nil
 	c.warmMu.Unlock()
+	c.hcCache.Range(func(k, _ any) bool { c.hcCache.Delete(k); return true })
 	c.refillWarm()
 }
 
@@ -143,6 +146,9 @@ func (c *Client) proxyEnabled() bool {
 // dropSticky sticky 代理失效（WAF 拦截/连接失败）时丢弃，下次重新取号。
 func (c *Client) dropSticky() {
 	c.proxyMu.Lock()
+	if c.stickyAddr != "" {
+		c.hcCache.Delete(c.stickyAddr)
+	}
 	c.stickyAddr, c.stickyAt = "", time.Time{}
 	c.proxyMu.Unlock()
 }
@@ -241,12 +247,12 @@ func (c *Client) refillWarm() {
 	}()
 }
 
-// fetchWorkingAddr 取号 + 探活：代理池部分出口被上游 WAF 标记（实测通过率约 1/15），
-// 8 个并发 worker 各自取号探活，任一返回 JSON 即胜出；上限 ~48 个号防止坏池死循环。
+// fetchWorkingAddr 取号 + 探活：不限尝试次数，4 路并发在 deadline 内一直试，
+// 任一出口返回 JSON 即胜出；超时才报错（池整体不可用时兜底）。
 func fetchWorkingAddr(api string) (string, error) {
-	const workers = 4 // 住宅池死节点多，单并发探活太慢；4 路折中取号压力与速度
-	const triesPerWorker = 8
-	ctx, cancel := context.WithCancel(context.Background())
+	const workers = 4
+	deadline := time.Now().Add(60 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	found := make(chan string, 1)
 	var wg sync.WaitGroup
@@ -254,10 +260,7 @@ func fetchWorkingAddr(api string) (string, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < triesPerWorker; j++ {
-				if ctx.Err() != nil {
-					return
-				}
+			for ctx.Err() == nil {
 				addr, err := fetchProxyAddr(api)
 				if err != nil {
 					return
@@ -279,9 +282,9 @@ func fetchWorkingAddr(api string) (string, error) {
 	case addr := <-found:
 		return addr, nil
 	case <-done:
-		return "", fmt.Errorf("代理池探测 %d 个号均被上游拦截", workers*triesPerWorker)
-	case <-time.After(45 * time.Second):
-		return "", fmt.Errorf("代理池探测超时（45s）")
+		return "", fmt.Errorf("代理取号失败或出口均被上游拦截")
+	case <-ctx.Done():
+		return "", fmt.Errorf("代理池探测超时（60s 未找到可用出口）")
 	}
 }
 
@@ -380,14 +383,25 @@ func normalizeProxyURL(line, api string) string {
 	return scheme + "://" + line
 }
 
-// clientFor 取 HTTP 客户端：按模式取代理出口；未配置代理直连。
-func (c *Client) clientFor(sticky bool) (*http.Client, error) {
-	addr, err := c.proxyAddr(sticky)
-	if err != nil {
-		return nil, err
-	}
-	if addr == "" {
-		return c.hc, nil
+// ctxPinnedProxy 请求级固定代理：下单与取码共用同一出口（少一次取号+握手，
+// 且对上游而言同一 IP 更自然）。
+type ctxKeyPinnedProxy struct{}
+
+// WithPinnedProxy 把 ctx 里的上游请求固定经 addr 出口。
+func WithPinnedProxy(ctx context.Context, addr string) context.Context {
+	return context.WithValue(ctx, ctxKeyPinnedProxy{}, addr)
+}
+
+// OrderProxy 给一笔订单分配一个已探活的 rotating 出口（热池优先）。
+func (c *Client) OrderProxy(ctx context.Context) (string, error) {
+	return c.proxyAddr(false)
+}
+
+// clientForAddr 代理 URL → 复用 keep-alive 连接的 http.Client（按地址缓存，
+// 住宅代理握手贵，连接复用把同出口的二次请求从 ~1.5s 降到 ~300ms）。
+func (c *Client) clientForAddr(addr string) (*http.Client, error) {
+	if hc, ok := c.hcCache.Load(addr); ok {
+		return hc.(*http.Client), nil
 	}
 	u, err := url.Parse(addr)
 	if err != nil {
@@ -395,12 +409,29 @@ func (c *Client) clientFor(sticky bool) (*http.Client, error) {
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = http.ProxyURL(u)
-	return &http.Client{Transport: tr, Timeout: 20 * time.Second}, nil
+	hc := &http.Client{Transport: tr, Timeout: 20 * time.Second}
+	actual, _ := c.hcCache.LoadOrStore(addr, hc)
+	return actual.(*http.Client), nil
+}
+
+// clientFor 取 HTTP 客户端：ctx 固定代理优先，其次按 sticky/rotating 取出口；未配置代理直连。
+func (c *Client) clientFor(ctx context.Context, sticky bool) (*http.Client, error) {
+	if addr, _ := ctx.Value(ctxKeyPinnedProxy{}).(string); addr != "" {
+		return c.clientForAddr(addr)
+	}
+	addr, err := c.proxyAddr(sticky)
+	if err != nil {
+		return nil, err
+	}
+	if addr == "" {
+		return c.hc, nil
+	}
+	return c.clientForAddr(addr)
 }
 
 // do 执行请求并读回响应体；WAF 返回 HTML 挑战页时作废 sticky 会话。
 func (c *Client) do(req *http.Request, sticky bool) ([]byte, int, error) {
-	hc, err := c.clientFor(sticky)
+	hc, err := c.clientFor(req.Context(), sticky)
 	if err != nil {
 		return nil, 0, err
 	}
