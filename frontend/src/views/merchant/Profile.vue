@@ -274,7 +274,7 @@ const externalRules = {
 }
 
 // 上游对接状态（仅管理员可用 upstreamSvc）
-const up = ref({ configured: 0, username: '', nickname: '', shop: '', goodsKey: '', goodsID: 0, goodsName: '', unitPrice: 0, stockAmount: 100000, upAvailable: 0, upFrozen: 0, walletReady: 0, tokenAge: -1, proxyApi: '' })
+const up = ref({ configured: 0, username: '', nickname: '', shop: '', goodsKey: '', goodsID: 0, goodsName: '', unitPrice: 0, stockAmount: 100000, upAvailable: 0, upFrozen: 0, walletReady: 0, tokenAge: -1, proxyAPI: '' })
 const stockAmount = ref('')
 const stockSaving = ref(false)
 const proxyApi = ref('')
@@ -371,7 +371,7 @@ async function loadUpstream() {
     const st = await call(client.upstreamSvc.status())
     up.value = st
     stockAmount.value = fen2yuan(st.stockAmount) || ''
-    proxyApi.value = st.proxyApi || ''
+    proxyApi.value = st.proxyAPI || ''
     if (st.configured) {
       externalForm.account = st.username
       externalResult.value = { account: st.username, nickname: st.nickname, shop: st.shop }
@@ -460,8 +460,8 @@ async function saveProxy() {
   proxySaving.value = true
   try {
     up.value = await call(client.upstreamSvc.setProxy({ proxyAPI: proxyApi.value.trim() }))
-    proxyApi.value = up.value.proxyApi || ''
-    message.success(up.value.proxyApi ? '代理已启用' : '已切回直连')
+    proxyApi.value = up.value.proxyAPI || ''
+    message.success(up.value.proxyAPI ? '代理已启用' : '已切回直连')
   } catch (e) {
     message.error(e.message)
   } finally {
