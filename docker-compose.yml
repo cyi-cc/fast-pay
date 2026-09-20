@@ -24,6 +24,10 @@ services:
     # 仅容器网络内可达（前端 nginx 反代）；调试时可映射 "127.0.0.1:9200:9200"
     expose:
       - "9200"
+    # web 被 Dokploy 只挂到 overlay 后，仍要能用服务名 server 反代 9200
+    networks:
+      - default
+      - dokploy-network
     logging:
       options:
         max-size: "10m"
@@ -43,6 +47,9 @@ services:
       - "4000:4000"
     restart: unless-stopped
     mem_limit: 128m
+    networks:
+      - default
+      - dokploy-network
     logging:
       options:
         max-size: "10m"
@@ -50,3 +57,7 @@ services:
 
 volumes:
   epay_data:
+
+networks:
+  dokploy-network:
+    external: true
