@@ -1,4 +1,4 @@
-# Fast Pay 编排：后端（内嵌 SQLite）+ 前端 nginx（宿主 4000 → 容器 4000）。
+﻿# Fast Pay 编排：后端（内嵌 SQLite）+ 前端 nginx（宿主 4000 → 容器 4000）。
 #
 # 使用：
 #   docker compose up -d
@@ -11,7 +11,7 @@
 #   前端   docker build -t epay-web .          # compose 内已带 NGINX_CONF=compose.conf
 
 services:
-  server:
+  epay-server:
     image: epay-backend:latest
     build:
       context: .
@@ -24,7 +24,8 @@ services:
     # 仅容器网络内可达（前端 nginx 反代）；调试时可映射 "127.0.0.1:9200:9200"
     expose:
       - "9200"
-    # web 被 Dokploy 只挂到 overlay 后，仍要能用服务名 server 反代 9200
+    # web 被 Dokploy 只挂到 overlay 后，仍要能用 epay-server 反代 9200；
+    # 服务名不能用 server——dokploy-network 上已有 vivid 的同名服务会撞名
     networks:
       - default
       - dokploy-network
@@ -38,11 +39,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # compose 网络版 conf：反代 server:9200（默认 conf 是 host 网络 127.0.0.1 版）
+      # compose 网络版 conf：反代 epay-server:9200（默认 conf 是 host 网络 127.0.0.1 版）
       args:
         NGINX_CONF: compose.conf
     depends_on:
-      - server
+      - epay-server
     ports:
       - "4000:4000"
     restart: unless-stopped
