@@ -146,7 +146,8 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 	if api == "" {
 		return "", nil
 	}
-	addr, err := fetchProxyAddr(api)
+	// 代理池部分出口已被上游 WAF 标记：取号后先探活，被拦就换，直到拿到可用出口
+	addr, err := fetchWorkingAddr(api)
 	if err != nil {
 		return "", err
 	}
@@ -156,6 +157,53 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 		c.proxyMu.Unlock()
 	}
 	return addr, nil
+}
+
+// fetchWorkingAddr 取号 + 探活循环：probe 端点返回 JSON 才算可用出口。
+// 最多尝试 proxyProbeMax 个号，避免坏池无限循环（实测该池通过率约 1/15）。
+const proxyProbeMax = 30
+
+func fetchWorkingAddr(api string) (string, error) {
+	var lastErr error
+	for i := 0; i < proxyProbeMax; i++ {
+		addr, err := fetchProxyAddr(api)
+		if err != nil {
+			return "", err
+		}
+		if probeAddr(addr) {
+			return addr, nil
+		}
+		lastErr = fmt.Errorf("代理 %s 被上游拦截", addr)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("代理 API 未返回可用代理")
+	}
+	return "", fmt.Errorf("连续 %d 个代理均被上游拦截: %w", proxyProbeMax, lastErr)
+}
+
+// probeAddr 经代理探测上游登录端点：正常返回 JSON（{"code":...}），
+// 被 WAF 拦截则返回 HTML 挑战页（以 '<' 开头）。
+func probeAddr(addr string) bool {
+	u, err := url.Parse("http://" + addr)
+	if err != nil {
+		return false
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = http.ProxyURL(u)
+	hc := &http.Client{Transport: tr, Timeout: 6 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, defaultBase+"/merchantApi/user/login",
+		strings.NewReader("{}"))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	return bytes.HasPrefix(bytes.TrimSpace(data), []byte("{"))
 }
 
 // fetchProxyAddr 调代理供应商 API 取一个出口地址。
