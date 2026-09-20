@@ -66,7 +66,6 @@ type UpstreamStatusView struct {
 type UpstreamAccountDto struct {
 	Username string
 	Password string
-	ProxyAPI string // 代理取号 API；掩码值 = 保持不变，空 = 清除
 }
 
 type UpstreamGoodsQueryDto struct {
@@ -264,14 +263,6 @@ func (s *UpstreamSvc) SaveAccount(dto UpstreamAccountDto) (UpstreamStatusView, e
 		}
 		password = pwd
 	}
-	// 代理 API：提交了非掩码新值才更新（留空不动现有配置，单独管理见 SetProxy）
-	curProxy := s.Db.SettingStr(keyUpProxyAPI, "")
-	if v := strings.TrimSpace(dto.ProxyAPI); v != "" && v != maskProxyAPI(curProxy) && v != curProxy {
-		if err := s.Db.SetSetting(keyUpProxyAPI, v); err != nil {
-			return UpstreamStatusView{}, fun.Error(5000, "保存配置失败")
-		}
-	}
-	s.Up.SetProxyAPI(s.Db.SettingStr(keyUpProxyAPI, ""))
 	if err := s.Up.SetCredentials(dto.Username, password); err != nil {
 		return UpstreamStatusView{}, err
 	}
