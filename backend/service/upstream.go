@@ -470,7 +470,7 @@ func (s *UpstreamSvc) TestPay(dto TestPayDto) (TestPayResult, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		"http://127.0.0.1:"+int64Str(int64(s.Cfg.Port))+"/mapi.php", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
 	if err != nil {
 		return TestPayResult{}, fun.Error(5000, "调用本地支付接口失败")
 	}
