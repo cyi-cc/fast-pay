@@ -17,6 +17,14 @@ shot*.js
 har_extract*.js
 temp_*.png
 
+# 本地调试/服务器脚本（含凭据，勿提交）
+.tmp-ssh/
+lktest/
+ssh_run.cmd
+test_*.sh
+test_*.py
+dump_settings.py
+
 # 编辑器/系统
 .idea/
 .vscode/
