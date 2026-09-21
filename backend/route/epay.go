@@ -284,6 +284,7 @@ func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey stri
 		res, err = e.Up.CreateOrder(ctx, goodsKey, quantity, channelID, contact, queryPwd)
 	}
 	if err != nil {
+		log.Printf("[epay] 订单 %s 上游下单失败: %v", order.TradeNo, err)
 		return errors.New("上游下单失败：" + err.Error())
 	}
 	order.Payurl = res.PayURL
@@ -303,6 +304,7 @@ func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey stri
 	// 抓上游收银台里的微信支付二维码内容（weixin:// 串）
 	qrcode, qrErr := e.Up.FetchQRCode(ctx, res.TradeNo)
 	if qrErr != nil {
+		log.Printf("[epay] 订单 %s 上游取码失败: %v", order.TradeNo, qrErr)
 		return errors.New("上游未返回二维码：" + qrErr.Error())
 	}
 	if qrcode == "" {
