@@ -32,7 +32,10 @@ const (
 	keyEncKey      = "enc_key"
 	keyUpToken     = "up_token"
 	keyUpTokenAt   = "up_token_at"
-	keyUpProxyAPI  = "up_proxy_api"   // 代理取号 API，返回 {"data":[{"ip","port"}]}；空 = 直连
+	keyUpProxyAPI  = "up_proxy_api" // 代理取号 API，返回 {"data":[{"ip","port"}]}；空 = 直连
+	keyUpGoodsID   = "up_goods_id"
+	keyUpUnitPrice = "up_unit_price"
+	keyUpStock     = "up_stock_amount"
 	stickyTTL      = 4 * time.Minute  // sticky 会话复用时长（供应商会话 TTL 多为 5min）
 	tokenMaxAgeSec = 9 * 24 * 60 * 60 // JWT 约 10 天，9 天为安全上限
 )
@@ -69,7 +72,16 @@ type Client struct {
 	channelID int64 // 微信支付通道缓存（10 分钟）
 	channelAt int64
 
-	orderMu sync.Mutex // 串行化「查库存→补库存→下单」，避免并发订单抢同一批卡
+	orderMu sync.Mutex
+
+	stockMu       sync.Mutex
+	stockWorkMu   sync.Mutex
+	stockGoodsID  int64
+	stockTarget   int64
+	stockEstimate int64
+	stockSyncing  bool
+	stockSyncUsed int64
+	stockGen      uint64
 
 	proxyMu    sync.Mutex
 	proxyAPI   string    // 代理取号 API 地址
@@ -77,7 +89,7 @@ type Client struct {
 	stickyAt   time.Time // sticky 代理获取时间
 
 	warmMu  sync.Mutex
-	warm    []warmProxy // 已探活的 rotating 代理热池：下单直接取，异步补足
+	warm    []warmProxy // 预取的 rotating 代理热池：下单直接取，异步补足
 	warming bool        // 后台补池去重
 
 	hcCache   sync.Map // proxyURL → *http.Client：同出口请求复用 keep-alive 连接
@@ -118,6 +130,11 @@ func (c *Client) New() error {
 	}
 	c.proxyAPI = c.Db.SettingStr(keyUpProxyAPI, "")
 	c.refillWarm() // 启动即后台预热代理池
+	goodsID := c.Db.SettingInt(keyUpGoodsID, 0)
+	unitPrice := c.Db.SettingInt(keyUpUnitPrice, 0)
+	if goodsID > 0 && unitPrice > 0 {
+		c.MaintainStockAsync(goodsID, c.Db.SettingInt(keyUpStock, 100000)/unitPrice)
+	}
 	return nil
 }
 
@@ -169,7 +186,7 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 		return "", nil
 	}
 	if !sticky {
-		// rotating：优先取后台热池里已探活的代理，没有才现场取号探活
+		// rotating：优先取后台预取的代理，没有才现场取号
 		if addr := c.popWarm(); addr != "" {
 			return addr, nil
 		}
@@ -193,7 +210,7 @@ const (
 	warmTTL  = 3 * time.Minute
 )
 
-// popWarm 从热池取一个已探活代理；过期条目丢弃。取空时后台补池。
+// popWarm 从热池取一个预取代理；过期条目丢弃。取空时后台补池。
 func (c *Client) popWarm() string {
 	c.warmMu.Lock()
 	for len(c.warm) > 0 {
@@ -328,7 +345,7 @@ func WithPinnedProxy(ctx context.Context, addr string) context.Context {
 	return context.WithValue(ctx, ctxKeyPinnedProxy{}, addr)
 }
 
-// OrderProxy 给一笔订单分配一个已探活的 rotating 出口（热池优先）。
+// OrderProxy 给一笔订单分配一个 rotating 出口（热池优先）。
 func (c *Client) OrderProxy(ctx context.Context) (string, error) {
 	return c.proxyAddr(false)
 }
@@ -781,6 +798,105 @@ func (c *Client) CardAddN(ctx context.Context, goodsID, n int64) error {
 	return nil
 }
 
+func (c *Client) RecordStockUse(goodsID, target, quantity int64) {
+	if goodsID <= 0 || target <= 0 || quantity <= 0 {
+		return
+	}
+	c.stockMu.Lock()
+	if c.stockGoodsID != goodsID || c.stockTarget != target {
+		c.stockGoodsID, c.stockTarget = goodsID, target
+		c.stockEstimate = target
+		c.stockSyncing = false
+		c.stockGen++
+	}
+	if c.stockEstimate > quantity {
+		c.stockEstimate -= quantity
+	} else {
+		c.stockEstimate = 0
+	}
+	if c.stockSyncing {
+		c.stockSyncUsed += quantity
+		c.stockMu.Unlock()
+		return
+	}
+	c.stockSyncing, c.stockSyncUsed = true, 0
+	c.stockGen++
+	gen := c.stockGen
+	c.stockMu.Unlock()
+	go c.maintainStock(goodsID, target, gen)
+}
+
+func (c *Client) MaintainStockAsync(goodsID, target int64) {
+	if goodsID <= 0 || target <= 0 {
+		return
+	}
+	c.stockMu.Lock()
+	if c.stockGoodsID != goodsID || c.stockTarget != target {
+		c.stockGoodsID, c.stockTarget = goodsID, target
+		c.stockEstimate = target
+		c.stockSyncing = false
+		c.stockGen++
+	}
+	if c.stockSyncing {
+		c.stockMu.Unlock()
+		return
+	}
+	c.stockSyncing, c.stockSyncUsed = true, 0
+	c.stockGen++
+	gen := c.stockGen
+	c.stockMu.Unlock()
+	go c.maintainStock(goodsID, target, gen)
+}
+
+func (c *Client) MaintainStock(ctx context.Context, goodsID, target int64) error {
+	_, err := c.maintainStockNow(ctx, goodsID, target)
+	return err
+}
+
+func (c *Client) maintainStock(goodsID, target int64, gen uint64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	finalStock, err := c.maintainStockNow(ctx, goodsID, target)
+	c.finishStockSync(goodsID, target, gen, finalStock, err)
+}
+
+func (c *Client) maintainStockNow(ctx context.Context, goodsID, target int64) (int64, error) {
+	c.stockWorkMu.Lock()
+	defer c.stockWorkMu.Unlock()
+	_, _, stock, err := c.GoodsInfo(ctx, goodsID)
+	if err != nil {
+		return 0, err
+	}
+	if stock < target {
+		if err := c.CardAddN(ctx, goodsID, target-stock); err != nil {
+			return 0, err
+		}
+		stock = target
+	}
+	return stock, nil
+}
+
+func (c *Client) finishStockSync(goodsID, target int64, gen uint64, finalStock int64, err error) {
+	c.stockMu.Lock()
+	if c.stockGoodsID != goodsID || c.stockTarget != target || c.stockGen != gen {
+		c.stockMu.Unlock()
+		return
+	}
+	used := c.stockSyncUsed
+	if err == nil {
+		if finalStock > used {
+			c.stockEstimate = finalStock - used
+		} else {
+			c.stockEstimate = 0
+		}
+	}
+	c.stockSyncing, c.stockSyncUsed = false, 0
+	c.stockMu.Unlock()
+	if err == nil && used > 0 {
+		c.MaintainStockAsync(goodsID, target)
+	}
+}
+
 // ---------- 买家接口（无鉴权） ----------
 
 // Channel 支付通道。
@@ -976,7 +1092,7 @@ func RandContact() string { return "p" + randHex(10) + "@outlook.com" }
 // RandQueryPwd 随机订单查询密码。
 func RandQueryPwd() string { return randHex(8) }
 
-// RandCards 生成 n 张随机卡密（一行一张），下单前导入上游补足库存。
+// RandCards 生成 n 张随机卡密（一行一张），用于异步补充上游库存。
 func RandCards(n int64) string {
 	var b strings.Builder
 	for i := int64(0); i < n; i++ {

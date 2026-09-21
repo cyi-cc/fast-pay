@@ -236,16 +236,16 @@ func (s *UpstreamSvc) ensureGoods(ctx context.Context) error {
 		}
 	}
 	log.Printf("[upstream] 已绑定商品「%s」id=%d 单价 ¥0.01", redeemGoodsName, goodsID)
-	if created {
-		// 建品后填充初始库存；与下单共用互斥锁，避免初始填充和下单补库重复执行。
+	target := s.Db.SettingInt(keyUpStockAmount, 100000) / redeemPriceFen
+	if created && target > 0 {
 		unlock := s.Up.OrderLock()
-		defer unlock()
-		if target := s.Db.SettingInt(keyUpStockAmount, 100000) / redeemPriceFen; target > 0 {
-			if err := s.Up.CardAddN(ctx, goodsID, target); err != nil {
-				return err
-			}
+		if err := s.Up.CardAddN(ctx, goodsID, target); err != nil {
+			unlock()
+			return err
 		}
+		unlock()
 	}
+	s.Up.MaintainStockAsync(goodsID, target)
 	return nil
 }
 
@@ -362,7 +362,7 @@ type UpstreamStockDto struct {
 	StockAmount string // 元
 }
 
-// SetStock 设置库存目标金额：下单前库存不足时一次性补到该目标。
+// SetStock 设置库存目标金额；保存后立即在后台同步补足。
 func (s *UpstreamSvc) SetStock(dto UpstreamStockDto) (UpstreamStatusView, error) {
 	amount, err := domain.YuanToFen(dto.StockAmount)
 	if err != nil {
@@ -374,11 +374,15 @@ func (s *UpstreamSvc) SetStock(dto UpstreamStockDto) (UpstreamStatusView, error)
 	if amount > 1_000_000 {
 		return UpstreamStatusView{}, errParam("库存金额不能超过 10000 元")
 	}
-	if p := s.Db.SettingInt(keyUpUnitPrice, 0); p > 0 && amount%p != 0 {
+	p := s.Db.SettingInt(keyUpUnitPrice, 0)
+	if p > 0 && amount%p != 0 {
 		return UpstreamStatusView{}, errParam("库存目标必须是商品单价 " + domain.FenToYuan(p) + " 元的整数倍")
 	}
 	if err := s.Db.SetSetting(keyUpStockAmount, int64Str(amount)); err != nil {
 		return UpstreamStatusView{}, fun.Error(5000, "保存失败")
+	}
+	if goodsID := s.Db.SettingInt(keyUpGoodsID, 0); goodsID > 0 && p > 0 {
+		s.Up.MaintainStockAsync(goodsID, amount/p)
 	}
 	return s.Status()
 }

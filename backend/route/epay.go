@@ -195,8 +195,10 @@ func (e *Epay) createOrder(c *fun.RouteCtx) (db.Order, error) {
 
 	// 所有支付必须走自动对接的上游商品。
 	goodsKey := e.Db.SettingStr("up_goods_key", "")
+	goodsID := e.Db.SettingInt("up_goods_id", 0)
 	unitPrice := e.Db.SettingInt("up_unit_price", 0)
-	if goodsKey == "" || unitPrice <= 0 {
+	stockAmount := e.Db.SettingInt("up_stock_amount", 100000)
+	if goodsKey == "" || goodsID <= 0 || unitPrice <= 0 {
 		return db.Order{}, errors.New("上游商品未配置：请先在个人页登录上游账号，系统将自动创建兑换码商品")
 	}
 	if money%unitPrice != 0 {
@@ -245,7 +247,7 @@ func (e *Epay) createOrder(c *fun.RouteCtx) (db.Order, error) {
 		}
 		log.Printf("[epay] 新订单 %s pid=%d 金额=%s", order.TradeNo, app.AppID, domain.FenToYuan(money))
 		if quantity > 0 {
-			if err := e.placeUpstream(ctx, &order, goodsKey, quantity, unitPrice); err != nil {
+			if err := e.placeUpstream(ctx, &order, goodsKey, goodsID, stockAmount/unitPrice, quantity, unitPrice); err != nil {
 				// 上游单未落地才关闭本地单；已落地的留待支付，轮询器兜底结算
 				if order.UpstreamTradeNo == "" {
 					_, _ = e.Db.Q.SetOrderStatus(ctx, db.SetOrderStatusParams{
@@ -261,7 +263,7 @@ func (e *Epay) createOrder(c *fun.RouteCtx) (db.Order, error) {
 }
 
 // placeUpstream 在上游平台按绑定商品数量下单，回写上游订单号与收银台地址。
-func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey string, quantity, unitPrice int64) error {
+func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey string, goodsID, target, quantity, unitPrice int64) error {
 	shop := e.Db.SettingStr("up_shop", "")
 	if shop == "" {
 		return errors.New("上游店铺未配置：请先在个人页登录上游账号")
@@ -270,40 +272,23 @@ func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey stri
 	if err != nil {
 		return errors.New("上游微信通道不可用：" + err.Error())
 	}
-	// 串行化 查库存→补库存→下单：库存低于目标就一次性补到配置的库存目标（默认 ¥1000），
-	// 订单金额超过库存目标时按订单数量补
-	unlock := e.Up.OrderLock()
-	defer unlock()
-	goodsID := e.Db.SettingInt("up_goods_id", 0)
-	if goodsID <= 0 {
-		return errors.New("上游商品未配置：请先在个人页登录上游账号，系统将自动创建兑换码商品")
-	}
-	_, _, stock, err := e.Up.GoodsInfo(ctx, goodsID)
-	target := e.Db.SettingInt("up_stock_amount", 100000) / unitPrice
-	if err == nil && stock < target {
-		// 库存低于目标即补到目标；订单数量超过目标时按订单数量补
-		add := target - stock
-		if need := quantity - stock; add < need {
-			add = need
-		}
-		if add > 0 {
-			if err := e.Up.CardAddN(ctx, goodsID, add); err != nil {
-				return errors.New("上游库存补充失败：" + err.Error())
-			}
-			log.Printf("[epay] 订单 %s 补充上游库存 %d 张", order.TradeNo, add)
-		}
-	} else if err != nil {
-		return errors.New("上游库存查询失败：" + err.Error())
-	}
-	// 一笔订单的下单+取码固定同一个已探活出口：省一次取号探活，同一 IP 也更自然
 	if addr, perr := e.Up.OrderProxy(ctx); perr == nil && addr != "" {
 		ctx = upstream.WithPinnedProxy(ctx, addr)
 	}
 	contact, queryPwd := upstream.RandContact(), upstream.RandQueryPwd()
 	res, err := e.Up.CreateOrder(ctx, goodsKey, quantity, channelID, contact, queryPwd)
+	if err != nil && strings.Contains(err.Error(), "库存") {
+		if stockErr := e.Up.MaintainStock(ctx, goodsID, max(target, quantity)); stockErr != nil {
+			return errors.New("上游库存补充失败：" + stockErr.Error())
+		}
+		res, err = e.Up.CreateOrder(ctx, goodsKey, quantity, channelID, contact, queryPwd)
+	}
 	if err != nil {
 		return errors.New("上游下单失败：" + err.Error())
 	}
+	order.Payurl = res.PayURL
+	order.UpstreamTradeNo = res.TradeNo
+	e.Up.RecordStockUse(goodsID, target, quantity)
 	if res.TotalAmount != order.Money {
 		log.Printf("[epay] 订单 %s 上游金额 %s 与本地 %s 不一致", order.TradeNo, domain.FenToYuan(res.TotalAmount), domain.FenToYuan(order.Money))
 	}
@@ -315,8 +300,6 @@ func (e *Epay) placeUpstream(ctx context.Context, order *db.Order, goodsKey stri
 	}); err != nil {
 		return errors.New("回写上游订单信息失败")
 	}
-	order.Payurl = res.PayURL
-	order.UpstreamTradeNo = res.TradeNo
 	// 抓上游收银台里的微信支付二维码内容（weixin:// 串）
 	qrcode, qrErr := e.Up.FetchQRCode(ctx, res.TradeNo)
 	if qrErr != nil {
