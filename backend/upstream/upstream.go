@@ -80,7 +80,8 @@ type Client struct {
 	warm    []warmProxy // 已探活的 rotating 代理热池：下单直接取，异步补足
 	warming bool        // 后台补池去重
 
-	hcCache sync.Map // proxyURL → *http.Client：同出口请求复用 keep-alive 连接
+	hcCache   sync.Map // proxyURL → *http.Client：同出口请求复用 keep-alive 连接
+	deadAddrs sync.Map // proxyURL → time.Time：请求失败/WAF 拦截的出口标记弃用
 }
 
 type warmProxy struct {
@@ -134,6 +135,7 @@ func (c *Client) SetProxyAPI(api string) {
 	c.warm = nil
 	c.warmMu.Unlock()
 	c.hcCache.Range(func(k, _ any) bool { c.hcCache.Delete(k); return true })
+	c.deadAddrs.Range(func(k, _ any) bool { c.deadAddrs.Delete(k); return true })
 	c.refillWarm()
 }
 
@@ -172,8 +174,8 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 			return addr, nil
 		}
 	}
-	// 代理池部分出口已被上游 WAF 标记：取号后先探活，被拦就换，直到拿到可用出口
-	addr, err := fetchWorkingAddr(api)
+	// 不探活：取号直接用，请求失败由上层重试换新出口（死出口失败很快）
+	addr, err := fetchProxyAddr(api)
 	if err != nil {
 		return "", err
 	}
@@ -197,7 +199,7 @@ func (c *Client) popWarm() string {
 	for len(c.warm) > 0 {
 		p := c.warm[0]
 		c.warm = c.warm[1:]
-		if time.Since(p.At) < warmTTL {
+		if time.Since(p.At) < warmTTL && !c.isDead(p.Addr) {
 			c.warmMu.Unlock()
 			c.refillWarm()
 			return p.Addr
@@ -236,7 +238,7 @@ func (c *Client) refillWarm() {
 			if n >= warmSize {
 				return
 			}
-			addr, err := fetchWorkingAddr(api)
+			addr, err := fetchProxyAddr(api)
 			if err != nil {
 				return // 池子暂时不可用，下次取用再试
 			}
@@ -245,72 +247,6 @@ func (c *Client) refillWarm() {
 			c.warmMu.Unlock()
 		}
 	}()
-}
-
-// fetchWorkingAddr 取号 + 探活：不限尝试次数，4 路并发在 deadline 内一直试，
-// 任一出口返回 JSON 即胜出；超时才报错（池整体不可用时兜底）。
-func fetchWorkingAddr(api string) (string, error) {
-	const workers = 4
-	deadline := time.Now().Add(60 * time.Second)
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	defer cancel()
-	found := make(chan string, 1)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ctx.Err() == nil {
-				addr, err := fetchProxyAddr(api)
-				if err != nil {
-					return
-				}
-				if probeAddr(addr) {
-					select {
-					case found <- addr:
-					default:
-					}
-					cancel()
-					return
-				}
-			}
-		}()
-	}
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case addr := <-found:
-		return addr, nil
-	case <-done:
-		return "", fmt.Errorf("代理取号失败或出口均被上游拦截")
-	case <-ctx.Done():
-		return "", fmt.Errorf("代理池探测超时（60s 未找到可用出口）")
-	}
-}
-
-// probeAddr 经代理探测上游登录端点：正常返回 JSON（{"code":...}），
-// 被 WAF 拦截则返回 HTML 挑战页（以 '<' 开头）。
-func probeAddr(proxyURL string) bool {
-	u, err := url.Parse(proxyURL)
-	if err != nil {
-		return false
-	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.Proxy = http.ProxyURL(u)
-	hc := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-	req, err := http.NewRequest(http.MethodPost, defaultBase+"/merchantApi/user/login",
-		strings.NewReader("{}"))
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := hc.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-	return bytes.HasPrefix(bytes.TrimSpace(data), []byte("{"))
 }
 
 // fetchProxyAddr 调代理供应商 API 取一个出口，返回归一化代理 URL。
@@ -414,9 +350,28 @@ func (c *Client) clientForAddr(addr string) (*http.Client, error) {
 	return actual.(*http.Client), nil
 }
 
-// clientFor 取 HTTP 客户端：ctx 固定代理优先，其次按 sticky/rotating 取出口；未配置代理直连。
-func (c *Client) clientFor(ctx context.Context, sticky bool) (*http.Client, error) {
+// markBad 标记固定出口失效：pin 的代理死一次就弃用，同请求的后续重试换新出口。
+func (c *Client) markBad(ctx context.Context) {
 	if addr, _ := ctx.Value(ctxKeyPinnedProxy{}).(string); addr != "" {
+		c.deadAddrs.Store(addr, time.Now())
+		c.hcCache.Delete(addr)
+	}
+}
+
+func (c *Client) isDead(addr string) bool {
+	if t, ok := c.deadAddrs.Load(addr); ok {
+		if time.Since(t.(time.Time)) < 15*time.Minute {
+			return true
+		}
+		c.deadAddrs.Delete(addr)
+	}
+	return false
+}
+
+// clientFor 取 HTTP 客户端：ctx 固定代理优先（已标记死亡的跳过），
+// 其次按 sticky/rotating 取出口；未配置代理直连。
+func (c *Client) clientFor(ctx context.Context, sticky bool) (*http.Client, error) {
+	if addr, _ := ctx.Value(ctxKeyPinnedProxy{}).(string); addr != "" && !c.isDead(addr) {
 		return c.clientForAddr(addr)
 	}
 	addr, err := c.proxyAddr(sticky)
@@ -437,12 +392,14 @@ func (c *Client) do(req *http.Request, sticky bool) ([]byte, int, error) {
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		c.markBad(req.Context())
 		c.dropSticky()
 		return nil, 0, fmt.Errorf("上游请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("<")) {
+		c.markBad(req.Context())
 		c.dropSticky()
 	}
 	return data, resp.StatusCode, nil
@@ -568,7 +525,7 @@ func (c *Client) merchantPost(ctx context.Context, path string, body, out any) e
 // 配置了代理时，网络错误或非 JSON 响应（WAF 拦截）自动换代理重试一次；业务错误不重试。
 func (c *Client) post(ctx context.Context, path string, body any, merchantToken string, out any, sticky bool) error {
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		err := c.postOnce(ctx, path, body, merchantToken, out, sticky)
 		var ae *apiError
 		if err == nil || errors.Is(err, ErrAuth) || errors.As(err, &ae) || !c.proxyEnabled() {
