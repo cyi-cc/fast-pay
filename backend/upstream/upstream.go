@@ -872,14 +872,27 @@ func (c *Client) CreateOrder(ctx context.Context, goodsKey string, quantity, cha
 // FetchQRCode 抓取上游收银台页面里的微信支付二维码内容（weixin:// 串）。
 // 收银台 HTML 内嵌 generateQrcode.html?str=<双重编码的码内容>，解码两次还原。
 func (c *Client) FetchQRCode(ctx context.Context, tradeNo string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		c.base+"/payApi/WeixinNative/pay.html?trade_no="+tradeNo, nil)
-	if err != nil {
-		return "", err
+	// 出口可能中途失效：失败重试，markBad 会让下次换到新代理
+	var body []byte
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			c.base+"/payApi/WeixinNative/pay.html?trade_no="+tradeNo, nil)
+		if err != nil {
+			return "", err
+		}
+		body, _, err = c.do(req, false)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		if !c.proxyEnabled() {
+			break
+		}
 	}
-	body, _, err := c.do(req, false) // 取码与下单同链路，每次新代理
-	if err != nil {
-		return "", fmt.Errorf("获取收银台页面失败: %w", err)
+	if lastErr != nil {
+		return "", fmt.Errorf("获取收银台页面失败: %w", lastErr)
 	}
 	m := qrStrRe.FindSubmatch(body)
 	if len(m) < 2 {
@@ -926,10 +939,10 @@ func (c *Client) OrderCards(ctx context.Context, tradeNo string) ([]string, erro
 	return out.Response.Cards, nil
 }
 
-// postRaw 返回原始响应体（用于 code!=1 也是合法应答的接口）。代理故障自动重试一次。
+// postRaw 返回原始响应体（用于 code!=1 也是合法应答的接口）。代理故障自动重试。
 func (c *Client) postRaw(ctx context.Context, path string, body any, sticky bool) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		data, err := c.postRawOnce(ctx, path, body, sticky)
 		if err == nil || !c.proxyEnabled() {
 			return data, err
