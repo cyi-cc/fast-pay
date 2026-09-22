@@ -13,7 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -47,11 +49,12 @@ type apiError struct{ msg string }
 
 func (e *apiError) Error() string { return e.msg }
 
-// envelope 上游统一响应壳：code=1 成功。
+// envelope 上游统一响应壳：code=1 成功。异常响应的提示字段名不统一（msg/message）。
 type envelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
+	Code    int             `json:"code"`
+	Msg     string          `json:"msg"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
 }
 
 // Client 上游客户端单例（fun.Wired）。
@@ -191,8 +194,7 @@ func (c *Client) proxyAddr(sticky bool) (string, error) {
 			return addr, nil
 		}
 	}
-	// 不探活：取号直接用，请求失败由上层重试换新出口（死出口失败很快）
-	addr, err := fetchProxyAddr(api)
+	addr, err := c.fetchAliveAddr(api)
 	if err != nil {
 		return "", err
 	}
@@ -255,7 +257,7 @@ func (c *Client) refillWarm() {
 			if n >= warmSize {
 				return
 			}
-			addr, err := fetchProxyAddr(api)
+			addr, err := c.fetchAliveAddr(api)
 			if err != nil {
 				return // 池子暂时不可用，下次取用再试
 			}
@@ -334,6 +336,168 @@ func normalizeProxyURL(line, api string) string {
 		return scheme + "://" + parts[2] + ":" + parts[3] + "@" + parts[0] + ":" + parts[1]
 	}
 	return scheme + "://" + line
+}
+
+// ---------- 探活 ----------
+// 供应商出口池质量不稳定（实测新取的会话可能直接 general SOCKS server failure，
+// 任何目标都连不通），死出口会浪费业务请求的重试机会。取号后先做一次轻量探测，
+// 只把活的代理交给业务侧。
+
+const (
+	probeTries       = 5                // 单次取号最多丢弃的连续坏出口数
+	probeSockTimeout = 5 * time.Second  // SOCKS 连通探测超时
+	probeHTTPTimeout = 8 * time.Second  // HTTP 行为探测超时（含 TLS，住宅出口较慢）
+)
+
+// fetchAliveAddr 取号并探活：丢弃连不通上游的出口，返回首个可用的代理。
+func (c *Client) fetchAliveAddr(api string) (string, error) {
+	target := probeTarget(c.base)
+	for i := 1; i <= probeTries; i++ {
+		addr, err := fetchProxyAddr(api)
+		if err != nil {
+			return "", err
+		}
+		if c.probeProxy(addr, target) {
+			return addr, nil
+		}
+		c.hcCache.Delete(addr)
+		log.Printf("[upstream] 代理出口探活失败，丢弃重取（%d/%d）：%s", i, probeTries, redactProxy(addr))
+	}
+	return "", fmt.Errorf("连续 %d 个代理出口探活失败，代理池暂时不可用", probeTries)
+}
+
+// probeTarget 从上游 base 地址取探测目标 host:port。
+func probeTarget(base string) string {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return "wzyp.cn:443"
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "http" {
+			port = "80"
+		} else {
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// probeProxy 两级探测代理到上游的可用性：
+//  1. socks5 代理先做裸 SOCKS CONNECT（不建 TLS，滤掉死出口，单次约 0.3s）；
+//  2. HTTP 层查询一个不存在的商品价格——只读无副作用，好出口必然返回 JSON
+//     （code=0 "商品不存在"也算通过）；收到 HTML（WAF 挑战页/错误页）或传输
+//     失败则弃用。注意不能用 getUserChannel 探测：该接口在店铺未开通通道时
+//     对所有 token 都抛 PHP 异常，会把好出口误杀。
+//
+// http(s) 代理跳过第 1 级，直接走第 2 级。
+func (c *Client) probeProxy(addr, target string) bool {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(u.Scheme, "socks5") || strings.EqualFold(u.Scheme, "socks5h") {
+		host, portStr, err := net.SplitHostPort(target)
+		if err != nil {
+			return false
+		}
+		port, _ := strconv.Atoi(portStr)
+		if !probeSocks5(u, host, port, probeSockTimeout) {
+			return false
+		}
+	}
+	hc, err := c.clientForAddr(addr)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeHTTPTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.base+"/shopApi/Shop/getGoodsPrice", strings.NewReader(`{"goods_key":"__probe__","quantity":1}`))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return false // 传输层失败 = 出口死
+	}
+	defer resp.Body.Close()
+	head := make([]byte, 1)
+	if _, err := io.ReadFull(resp.Body, head); err != nil {
+		return false
+	}
+	// JSON 应答（含 code!=1 的错误 JSON）= 出口干净；'<' 开头 = WAF 挑战页/错误页
+	return head[0] == '{' || head[0] == '['
+}
+
+// probeSocks5 裸 SOCKS5 握手 + CONNECT 探测（标准库未导出 socks 包，自行实现）。
+func probeSocks5(u *url.URL, host string, port int, timeout time.Duration) bool {
+	if host == "" || len(host) > 255 || port <= 0 || port > 65535 {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(u.Hostname(), u.Port()), timeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(deadline)
+	// 提供方法：0 无鉴权 / 2 用户密码
+	if _, err := conn.Write([]byte{5, 2, 0, 2}); err != nil {
+		return false
+	}
+	var sel [2]byte
+	if _, err := io.ReadFull(conn, sel[:]); err != nil || sel[0] != 5 {
+		return false
+	}
+	switch sel[1] {
+	case 0: // 无需鉴权
+	case 2: // 用户密码子协商（版本 1）
+		user := u.User.Username()
+		pass, _ := u.User.Password()
+		if len(user) > 255 || len(pass) > 255 {
+			return false
+		}
+		auth := make([]byte, 0, 3+len(user)+len(pass))
+		auth = append(auth, 1, byte(len(user)))
+		auth = append(auth, user...)
+		auth = append(auth, byte(len(pass)))
+		auth = append(auth, pass...)
+		if _, err := conn.Write(auth); err != nil {
+			return false
+		}
+		var st [2]byte
+		if _, err := io.ReadFull(conn, st[:]); err != nil || st[1] != 0 {
+			return false
+		}
+	default: // 服务器不接受我们支持的方法
+		return false
+	}
+	// CONNECT host:port（ATYP=3 域名）
+	req := make([]byte, 0, 7+len(host))
+	req = append(req, 5, 1, 0, 3, byte(len(host)))
+	req = append(req, host...)
+	req = append(req, byte(port>>8), byte(port&0xff))
+	if _, err := conn.Write(req); err != nil {
+		return false
+	}
+	var head [4]byte // ver rep rsv atyp
+	if _, err := io.ReadFull(conn, head[:]); err != nil || head[0] != 5 {
+		return false
+	}
+	return head[1] == 0 // 0 成功；1 即 general SOCKS server failure
+}
+
+// redactProxy 日志脱敏：去掉 URL 里的会话凭据，只留 scheme://ip:port。
+func redactProxy(addr string) string {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return addr
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // ctxPinnedProxy 请求级固定代理：下单与取码共用同一出口（少一次取号+握手，
@@ -563,6 +727,7 @@ func (c *Client) postOnce(ctx context.Context, path string, body any, merchantTo
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json") // 上游出错时返回 JSON 而非 ThinkPHP HTML 错误页
 	if merchantToken != "" {
 		req.Header.Set("Merchant-Token", merchantToken)
 	}
@@ -584,6 +749,9 @@ func (c *Client) postOnce(ctx context.Context, path string, body any, merchantTo
 	}
 	if env.Code != 1 {
 		msg := env.Msg
+		if msg == "" {
+			msg = env.Message
+		}
 		if strings.Contains(msg, "登录") || strings.Contains(msg, "登陆") || strings.Contains(msg, "授权") {
 			return ErrAuth
 		}
@@ -919,6 +1087,11 @@ func (c *Client) WechatChannelID(ctx context.Context, shop string) (int64, error
 	c.mu.Unlock()
 	var list []Channel
 	if err := c.post(ctx, "/shopApi/Shop/getUserChannel", map[string]any{"token": shop}, "", &list, true); err != nil {
+		// 店铺未开通支付通道时上游直接抛 PHP 异常（Attempt to read property on bool），
+		// 翻译成可操作的提示而不是原始报错
+		if strings.Contains(err.Error(), "Attempt to read property") {
+			return 0, &apiError{"上游店铺支付通道未开通：请用该商户账号登录链动小铺，完成店铺/支付通道开通后重试"}
+		}
 		return 0, err
 	}
 	var fallback int64
