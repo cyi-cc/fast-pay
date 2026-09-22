@@ -779,13 +779,27 @@ func (c *Client) Userinfo(ctx context.Context) (nickname, shop string, err error
 	if err := c.merchantPost(ctx, "/merchantApi/user/userinfo", map[string]any{}, &out); err != nil {
 		return "", "", err
 	}
+	// userinfo.link_website 可能与店铺实际买家链接不一致（实测有账号该字段为旧值，
+	// 买家接口按它查店铺会"链接不存在"）。以 shop/getLink 返回的 /shop/<token> 为准，
+	// 拿不到时回退 link_website。
+	shop = out.LinkWebsite
+	var link struct {
+		Link string `json:"link"`
+	}
+	if err := c.merchantPost(ctx, "/merchantApi/shop/getLink", map[string]any{}, &link); err == nil && link.Link != "" {
+		if u, perr := url.Parse(link.Link); perr == nil && strings.HasPrefix(u.Path, "/shop/") {
+			if seg := strings.Trim(u.Path[len("/shop/"):], "/"); seg != "" && !strings.Contains(seg, "/") {
+				shop = seg
+			}
+		}
+	}
 	c.mu.Lock()
-	if c.shop != out.LinkWebsite {
+	if c.shop != shop {
 		c.channelID, c.channelAt = 0, 0
 	}
-	c.nickname, c.shop = out.Nickname, out.LinkWebsite
+	c.nickname, c.shop = out.Nickname, shop
 	c.mu.Unlock()
-	return out.Nickname, out.LinkWebsite, nil
+	return out.Nickname, shop, nil
 }
 
 // MerchantGoods 商户商品列表项。
